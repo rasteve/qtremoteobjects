@@ -43,7 +43,7 @@ struct ManagedGadgetTypeEntry
 
 static QMutex s_managedTypesMutex;
 static QHash<int, ManagedGadgetTypeEntry> s_managedTypes;
-static QHash<int, QSet<QtROIoDeviceBase*>> s_trackedConnections;
+static QHash<int, QSet<QObject*>> s_trackedReferences;
 static QLocalServer::SocketOptions s_localServerOptions = QLocalServer::NoOptions;
 
 static void GadgetsStaticMetacallFunction(QObject *_o, QMetaObject::Call _c, int _id, void **_a)
@@ -726,28 +726,32 @@ const QMetaObject *QRemoteObjectMetaObjectManager::metaObjectForType(const QStri
     return dynamicTypes.value(type);
 }
 
-static void trackConnection(int typeId, QtROIoDeviceBase *connection)
+static void trackReference(int typeId, QObject *reference)
 {
     QMutexLocker lock(&s_managedTypesMutex);
-    if (s_trackedConnections[typeId].contains(connection))
+    if (s_trackedReferences[typeId].contains(reference))
         return;
-    s_trackedConnections[typeId].insert(connection);
-    auto unregisterIfNotUsed = [typeId, connection]{
+    s_trackedReferences[typeId].insert(reference);
+    auto unregisterIfNotUsed = [typeId, reference]{
         QMutexLocker lock(&s_managedTypesMutex);
-        Q_ASSERT(s_trackedConnections.contains(typeId));
-        Q_ASSERT(s_trackedConnections[typeId].contains(connection));
-        s_trackedConnections[typeId].remove(connection);
-        if (s_trackedConnections[typeId].isEmpty()) {
-            s_trackedConnections.remove(typeId);
+        Q_ASSERT(s_trackedReferences.contains(typeId));
+        Q_ASSERT(s_trackedReferences[typeId].contains(reference));
+        s_trackedReferences[typeId].remove(reference);
+        if (s_trackedReferences[typeId].isEmpty()) {
+            s_trackedReferences.remove(typeId);
             s_managedTypes[typeId].unregisterMetaTypes();
             s_managedTypes.remove(typeId); // Destroys the meta types
         }
     };
 
-    // Unregister the type only when the connection is destroyed
-    // Do not unregister types when the connections is discconected, because
-    // if it gets reconnected it will not register the types again
-    QObject::connect(connection, &QtROIoDeviceBase::destroyed, connection, unregisterIfNotUsed);
+    // Unregister the type only when the reference is destroyed.  Original
+    // behavior was for the reference to be a connection (derived from
+    // QtROIoDeviceBase), but we want to allow language bindings so we
+    // now allow for any arbitrary QObject pointer to be used.
+    // If the reference is a connection, we do not want to unregister types
+    // when the connection is disconnected, because if it gets reconnected
+    // it will not register the types again.
+    QObject::connect(reference, &QObject::destroyed, reference, unregisterIfNotUsed);
 }
 
 struct EnumPair {
@@ -845,13 +849,13 @@ static TypeInfo *registerEnum(const QByteArray &name, uint size=4u)
     return result;
 }
 
-static int registerGadgets(QtROIoDeviceBase *connection, Gadgets &gadgets, QByteArray typeName)
+static int registerGadgets(QObject *reference, Gadgets &gadgets, QByteArray typeName)
 {
     const auto &gadget = gadgets.take(typeName);
     // TODO Look at having registerGadgets return QMetaType index of the id of the type
     int typeId = QMetaType::fromName(typeName).id();
     if (typeId != QMetaType::UnknownType) {
-        trackConnection(typeId, connection);
+        trackReference(typeId, reference);
         return typeId;
     }
 
@@ -863,7 +867,7 @@ static int registerGadgets(QtROIoDeviceBase *connection, Gadgets &gadgets, QByte
     for (const auto &prop : gadget.properties) {
         int propertyType = QMetaType::fromName(prop.type).id();
         if (!propertyType && gadgets.contains(prop.type))
-            propertyType = registerGadgets(connection, gadgets, prop.type);
+            propertyType = registerGadgets(reference, gadgets, prop.type);
         entry.gadgetType.push_back(QVariant(QMetaType(propertyType)));
         auto dynamicProperty = gadgetBuilder.addProperty(prop.name, prop.type);
         dynamicProperty.setWritable(true);
@@ -939,16 +943,16 @@ static int registerGadgets(QtROIoDeviceBase *connection, Gadgets &gadgets, QByte
         entry.gadgetMetaType = QMetaType(typeInfo);
     }
     const int gadgetTypeId = entry.gadgetMetaType.id();
-    trackConnection(gadgetTypeId, connection);
+    trackReference(gadgetTypeId, reference);
     QMutexLocker lock(&s_managedTypesMutex);
     s_managedTypes.insert(gadgetTypeId, entry);
     return gadgetTypeId;
 }
 
-static void registerAllGadgets(QtROIoDeviceBase *connection, Gadgets &gadgets)
+static void registerAllGadgets(QObject *reference, Gadgets &gadgets)
 {
     while (!gadgets.isEmpty())
-        registerGadgets(connection, gadgets, gadgets.constBegin().key());
+        registerGadgets(reference, gadgets, gadgets.constBegin().key());
 }
 
 static void deserializeEnum(QDataStream &ds, EnumData &enumData)
