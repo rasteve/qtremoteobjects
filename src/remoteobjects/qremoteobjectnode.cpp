@@ -785,6 +785,15 @@ static const char *strDup(const QByteArray &s)
 }
 
 using Gadgets = QHash<QByteArray, GadgetData>;
+// Registering types uses the QMetaTypeInterface struct.  This struct includes a function to let
+// QMetaType::metaObject() return the associated QMetaObject for enums and gadgets, but since we
+// are creating the enums dynamically with the gadgets/QObject classes, we need to
+//   a. Create the TypeInfo structs and register them
+//   b. Use QMetaObjectBuilder to add all replica types (which looks up QMetaType(s) by name)
+//   c. Create the QMetaObject from the builder
+//   d. Go back and assign the QMetaObject to the TypeInfo for future lookup
+// All of this requires a new QMetaTypeInterface with a spot to hold a pointer to the created
+// QMetaObject.
 struct TypeInfo : public QtPrivate::QMetaTypeInterface
 {
     const QMetaObject *metaObject;
@@ -849,55 +858,60 @@ static TypeInfo *registerEnum(const QByteArray &name, uint size=4u)
     return result;
 }
 
-static int registerGadgets(QObject *reference, Gadgets &gadgets, QByteArray typeName)
+static std::pair<QMap<QByteArray, QMetaType>, QList<TypeInfo *>>
+handleEnums(QMetaObjectBuilder &builder, const QList<EnumData> &enumList, const QByteArray &type)
 {
-    const auto &gadget = gadgets.take(typeName);
-    // TODO Look at having registerGadgets return QMetaType index of the id of the type
-    int typeId = QMetaType::fromName(typeName).id();
-    if (typeId != QMetaType::UnknownType) {
-        trackReference(typeId, reference);
-        return typeId;
-    }
-
-    ManagedGadgetTypeEntry entry;
-
-    QMetaObjectBuilder gadgetBuilder;
-    gadgetBuilder.setClassName(typeName);
-    gadgetBuilder.setFlags(DynamicMetaObject | PropertyAccessInStaticMetaCall);
-    for (const auto &prop : gadget.properties) {
-        int propertyType = QMetaType::fromName(prop.type).id();
-        if (!propertyType && gadgets.contains(prop.type))
-            propertyType = registerGadgets(reference, gadgets, prop.type);
-        entry.gadgetType.push_back(QVariant(QMetaType(propertyType)));
-        auto dynamicProperty = gadgetBuilder.addProperty(prop.name, prop.type);
-        dynamicProperty.setWritable(true);
-        dynamicProperty.setReadable(true);
-    }
     QList<TypeInfo *> enumsToBeAssignedMetaObject;
-    enumsToBeAssignedMetaObject.reserve(gadget.enums.size());
-    for (const auto &enumData: gadget.enums) {
-        auto enumBuilder = gadgetBuilder.addEnumerator(enumData.name);
+    QMap<QByteArray, QMetaType> enumLookup;
+    enumsToBeAssignedMetaObject.reserve(enumList.size());
+    for (const auto &enumData : enumList) {
+        const QByteArray registeredName = type + "::" + enumData.name;
+        auto typeInfo = registerEnum(registeredName, enumData.size);
+        QMetaType metaType;
+        if (typeInfo) {
+            enumsToBeAssignedMetaObject.append(typeInfo);
+            metaType = QMetaType(typeInfo);
+            metaType.registerType();
+            enumLookup[enumData.name] = metaType;
+            qCDebug(QT_REMOTEOBJECT) << "Registering new gadget enum with id" << metaType.id() << typeInfo->name << "size:" << typeInfo->size;
+        }
+        auto enumBuilder = builder.addEnumerator(enumData.name);
         enumBuilder.setIsFlag(enumData.isFlag);
         enumBuilder.setIsScoped(enumData.isScoped);
+        enumBuilder.setMetaType(metaType);
 
         for (quint32 k = 0; k < enumData.keyCount; ++k) {
             const auto pair = enumData.values.at(k);
             enumBuilder.addKey(pair.name, pair.value);
         }
-        const QByteArray registeredName = QByteArray(typeName).append("::").append(enumData.name);
-        auto typeInfo = registerEnum(registeredName, enumData.size);
-        if (typeInfo)
-            enumsToBeAssignedMetaObject.append(typeInfo);
     }
+    return {enumLookup, enumsToBeAssignedMetaObject};
+}
+
+static QMetaObject *registerGadget(QObject *reference, const GadgetData &gadget, QByteArray typeName)
+{
+    ManagedGadgetTypeEntry entry;
+
+    QMetaObjectBuilder gadgetBuilder;
+    gadgetBuilder.setClassName(typeName);
+    gadgetBuilder.setFlags(DynamicMetaObject | PropertyAccessInStaticMetaCall);
+
+    auto [enumLookup, enumsToBeAssignedMetaObject] = handleEnums(gadgetBuilder, gadget.enums, typeName);
+    for (auto metaType : enumLookup)
+        entry.enumMetaTypes.append(metaType);
+
+    for (const auto &prop : gadget.properties) {
+        int propertyType = QMetaType::fromName(prop.type).id();
+        entry.gadgetType.push_back(QVariant(QMetaType(propertyType)));
+        auto dynamicProperty = gadgetBuilder.addProperty(prop.name, prop.type);
+        dynamicProperty.setWritable(true);
+        dynamicProperty.setReadable(true);
+    }
+
     auto meta = gadgetBuilder.toMetaObject();
     entry.metaObject = std::shared_ptr<QMetaObject>{meta, [](QMetaObject *ptr){ ::free(ptr); }};
-    for (auto typeInfo : enumsToBeAssignedMetaObject) {
+    for (auto typeInfo : enumsToBeAssignedMetaObject)
         typeInfo->metaObject = meta;
-        auto metaType = QMetaType(typeInfo);
-        entry.enumMetaTypes.append(metaType);
-        auto id = metaType.id();
-        qCDebug(QT_REMOTEOBJECT) << "Registering new gadget enum with id" << id << typeInfo->name << "size:" << typeInfo->size;
-    }
 
     QMetaType::TypeFlags flags = QMetaType::IsGadget;
     if (meta->propertyCount()) {
@@ -942,11 +956,37 @@ static int registerGadgets(QObject *reference, Gadgets &gadgets, QByteArray type
         };
         entry.gadgetMetaType = QMetaType(typeInfo);
     }
+    entry.gadgetMetaType.registerType();
     const int gadgetTypeId = entry.gadgetMetaType.id();
     trackReference(gadgetTypeId, reference);
     QMutexLocker lock(&s_managedTypesMutex);
     s_managedTypes.insert(gadgetTypeId, entry);
-    return gadgetTypeId;
+    return meta;
+}
+
+static void registerGadgets(QObject *reference, Gadgets &gadgets, QByteArray typeName)
+{
+    // Ideally this would register a single gadget, but gadgets can depend on other gadgets.
+    // To account for this, the registerGadgets method can recurse, removing one Gadget at a
+    // time from the input list (which is passed in by non-const reference).
+
+    // If the type is already registered, just track the new reference and return
+    const auto &gadget = gadgets.take(typeName);
+    int typeId = QMetaType::fromName(typeName).id();
+    if (typeId != QMetaType::UnknownType) {
+        trackReference(typeId, reference);
+        return;
+    }
+
+    // Loop through the properties for dependent gadgets to register
+    for (const auto &prop : gadget.properties) {
+        int propertyType = QMetaType::fromName(prop.type).id();
+        if (!propertyType && gadgets.contains(prop.type))
+            registerGadgets(reference, gadgets, prop.type);
+    }
+
+    // Once there are no dependencies to address, add this type
+    registerGadget(reference, gadget, std::move(typeName));
 }
 
 static void registerAllGadgets(QObject *reference, Gadgets &gadgets)
