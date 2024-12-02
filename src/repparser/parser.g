@@ -141,8 +141,6 @@ struct ASTEnumParam
     {
     }
 
-    QString asString() const;
-
     QString name;
     int value;
 };
