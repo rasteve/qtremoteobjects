@@ -776,6 +776,38 @@ struct GadgetData {
     QList<EnumData> enums;
 };
 
+struct ClassProperty {
+    QByteArray name;
+    QByteArray typeName;
+    QByteArray signalName;
+    bool isWritable = false;
+};
+
+struct ClassSignal {
+    QByteArray signature;
+    QByteArrayList parameterNames;
+};
+
+struct ClassSlot {
+    QByteArray signature, returnType;
+    QByteArrayList parameterNames;
+};
+
+struct ClassData
+{
+    ClassData(bool _isSource = false) : isSource(_isSource)
+    {
+        baseMeta = _isSource ? &QObject::staticMetaObject : &QRemoteObjectReplica::staticMetaObject;
+    }
+    QByteArray type;
+    QList<ClassProperty> properties;
+    QList<ClassSignal> _signals;
+    QList<ClassSlot> _slots;
+    QList<EnumData> enums;
+    bool isSource;
+    const QMetaObject *baseMeta;
+};
+
 static const char *strDup(const QByteArray &s)
 {
     auto result = new char[uint(s.size()) + 1];
@@ -995,19 +1027,79 @@ static void registerAllGadgets(QObject *reference, Gadgets &gadgets)
         registerGadgets(reference, gadgets, gadgets.constBegin().key());
 }
 
-static void deserializeEnum(QDataStream &ds, EnumData &enumData)
+std::pair<QMetaObject *, QList<QMetaType>>
+registerDefinition(const ClassData &data)
 {
+    // TODO Fix appending "Source"/"Replica"
+    // auto type = data.type + (data.isSource ? "Source" : "");
+    auto type = data.type;
+    QMetaObjectBuilder builder;
+    builder.setSuperClass(data.baseMeta);
+    builder.setFlags(DynamicMetaObject);
+
+    builder.addClassInfo(QCLASSINFO_REMOTEOBJECT_TYPE, data.type);
+    builder.setClassName(type);
+
+    auto [enumLookup, enumsToBeAssignedMetaObject] = handleEnums(builder, data.enums, type);
+
+    for (const auto &signal : data._signals) {
+        auto mmb = builder.addSignal(signal.signature);
+        mmb.setParameterNames(signal.parameterNames);
+    }
+
+    for (const auto &slot : data._slots) {
+        const bool isVoid = slot.returnType.isEmpty() || slot.returnType == QByteArrayLiteral("void");
+        QMetaMethodBuilder mmb;
+        if (isVoid)
+            mmb = builder.addMethod(slot.signature);
+        else if (data.isSource)
+            mmb = builder.addMethod(slot.signature, slot.returnType);
+        else
+            mmb = builder.addMethod(slot.signature, QByteArrayLiteral("QRemoteObjectPendingCall"));
+        mmb.setParameterNames(slot.parameterNames);
+    }
+
+    for (const auto &prop : data.properties) {
+        QMetaPropertyBuilder mpb;
+        auto metaType = QMetaType::fromName(prop.typeName);
+        if (!metaType.isValid()) {
+            if (enumLookup.contains(prop.typeName))
+                metaType = enumLookup[prop.typeName];
+            else
+                qDebug() << "No metaType for property" << prop.name << "of type" << prop.typeName;
+        }
+        if (prop.signalName.isEmpty())
+            mpb = builder.addProperty(prop.name, prop.typeName, metaType);
+        else
+            mpb = builder.addProperty(prop.name, prop.typeName, metaType, builder.indexOfSignal(prop.signalName));
+        mpb.setWritable(prop.isWritable);
+    }
+
+    auto meta = builder.toMetaObject();
+    QList<QMetaType> newEnums(enumsToBeAssignedMetaObject.size());
+    for (auto typeInfo : enumsToBeAssignedMetaObject) {
+        typeInfo->metaObject = meta;
+        newEnums.append(QMetaType(typeInfo));
+    }
+    return {meta, newEnums};
+}
+
+static EnumData deserializeEnum(QDataStream &ds)
+{
+    EnumData enumData;
     ds >> enumData.name;
     ds >> enumData.isFlag;
     ds >> enumData.isScoped;
     ds >> enumData.size;
     ds >> enumData.keyCount;
+    enumData.values.reserve(enumData.keyCount);
     for (quint32 i = 0; i < enumData.keyCount; i++) {
         EnumPair pair;
         ds >> pair.name;
         ds >> pair.value;
-        enumData.values.push_back(pair);
+        enumData.values.append(std::move(pair));
     }
+    return enumData;
 }
 
 static void parseGadgets(QtROIoDeviceBase *connection, QDataStream &in)
@@ -1025,131 +1117,101 @@ static void parseGadgets(QtROIoDeviceBase *connection, QDataStream &in)
         return;
     Gadgets gadgets;
     for (quint32 i = 0; i < numGadgets; ++i) {
+        GadgetData gadget;
         QByteArray type;
         in >> type;
         quint32 numProperties, numEnums;
         in >> numProperties;
-        auto &properties = gadgets[type].properties;
+        gadget.properties.reserve(numProperties);
         for (quint32 p = 0; p < numProperties; ++p) {
             GadgetProperty prop;
             in >> prop.name;
             in >> prop.type;
-            properties.push_back(prop);
+            gadget.properties.append(std::move(prop));
         }
         in >> numEnums;
-        auto &enums = gadgets[type].enums;
-        for (quint32 e = 0; e < numEnums; ++e) {
-            EnumData enumData;
-            deserializeEnum(in, enumData);
-            enums.push_back(enumData);
-        }
+        gadget.enums.reserve(numEnums);
+        for (quint32 e = 0; e < numEnums; ++e)
+            gadget.enums.append(deserializeEnum(in));
+        gadgets[type] = std::move(gadget);
     }
     registerAllGadgets(connection, gadgets);
 }
 
 QMetaObject *QRemoteObjectMetaObjectManager::addDynamicType(QtROIoDeviceBase *connection, QDataStream &in)
 {
-    QMetaObjectBuilder builder;
-    builder.setSuperClass(&QRemoteObjectReplica::staticMetaObject);
-    builder.setFlags(DynamicMetaObject);
+    ClassData classData;
 
     QString typeString;
-    QByteArray type;
-    quint32 numEnums = 0;
-    quint32 numSignals = 0;
-    quint32 numMethods = 0;
-    quint32 numProperties = 0;
-    QHash<QByteArray, QByteArray> classEnums;
-
     in >> typeString;
-    type = typeString.toLatin1();
-    builder.addClassInfo(QCLASSINFO_REMOTEOBJECT_TYPE, type);
-    builder.setClassName(type);
+    classData.type = typeString.toLatin1();
+    // TODO Fix appending "Source"/"Replica"
+    // auto type = classData.type + (classData.isSource ? "Source" : "");
+    auto type = classData.type;
 
+    quint32 numEnums = 0;
     in >> numEnums;
-    QList<quint32> enumSizes(numEnums);
-    enumsToBeAssignedMetaObject.reserve(numEnums);
+    classData.enums.reserve(numEnums);
+    // QtRemoteObjects Dynamic types will get a class name from the .rep definition, which
+    // may be different from the name of the sending class if the QtRO API is used.  We use
+    // classEnums to ensure we update enum names.
+    QHash<QByteArray, QByteArray> classEnums;
     for (quint32 i = 0; i < numEnums; ++i) {
-        EnumData enumData;
-        deserializeEnum(in, enumData);
-        auto enumBuilder = builder.addEnumerator(enumData.name);
-        enumBuilder.setIsFlag(enumData.isFlag);
-        enumBuilder.setIsScoped(enumData.isScoped);
-        enumSizes[i] = enumData.size;
-
-        for (quint32 k = 0; k < enumData.keyCount; ++k) {
-            const auto pair = enumData.values.at(k);
-            enumBuilder.addKey(pair.name, pair.value);
-        }
-        const QByteArray registeredName = QByteArray(type).append("::").append(enumData.name);
-        classEnums[enumData.name] = registeredName;
-        auto typeInfo = registerEnum(registeredName, enumData.size);
-        if (typeInfo) {
-            enumsToBeAssignedMetaObject[typeInfo] = QMetaType(typeInfo);
-            int id = enumsToBeAssignedMetaObject[typeInfo].id();
-            qCDebug(QT_REMOTEOBJECT) << "Registering new class enum with id" << id << typeInfo->name << "size:" << typeInfo->size;
-        }
+        auto enumData = deserializeEnum(in);
+        // Include Source or Replica in the registered name
+        classEnums[enumData.name] = QByteArray(type).append("::").append(enumData.name);
+        classData.enums.append(std::move(enumData));
     }
+
     parseGadgets(connection, in);
 
+    quint32 numSignals = 0;
     in >> numSignals;
+    classData._signals.reserve(numSignals);
     for (quint32 i = 0; i < numSignals; ++i) {
-        QByteArray signature;
-        QByteArrayList paramNames;
-        in >> signature;
-        in >> paramNames;
-        auto mmb = builder.addSignal(signature);
-        mmb.setParameterNames(paramNames);
+        ClassSignal classSignal;
+        in >> classSignal.signature;
+        in >> classSignal.parameterNames;
+        classData._signals.append(std::move(classSignal));
     }
 
+    quint32 numMethods = 0;
     in >> numMethods;
+    classData._slots.reserve(numMethods);
     for (quint32 i = 0; i < numMethods; ++i) {
+        ClassSlot classSlot;
         QByteArray signature, returnType;
         QByteArrayList paramNames;
-        in >> signature;
-        in >> returnType;
-        in >> paramNames;
-        const bool isVoid = returnType.isEmpty() || returnType == QByteArrayLiteral("void");
-        QMetaMethodBuilder mmb;
-        if (isVoid)
-            mmb = builder.addMethod(signature);
-        else
-            mmb = builder.addMethod(signature, QByteArrayLiteral("QRemoteObjectPendingCall"));
-        mmb.setParameterNames(paramNames);
+        in >> classSlot.signature;
+        in >> classSlot.returnType;
+        in >> classSlot.parameterNames;
+        classData._slots.append(std::move(classSlot));
     }
 
+    quint32 numProperties = 0;
     in >> numProperties;
-
+    classData.properties.reserve(numProperties);
     for (quint32 i = 0; i < numProperties; ++i) {
-        QByteArray name;
-        QByteArray typeName;
-        QByteArray signalName;
-        in >> name;
-        in >> typeName;
-        in >> signalName;
+        ClassProperty classProperty;
+        in >> classProperty.name;
+        in >> classProperty.typeName;
+        in >> classProperty.signalName;
+        classProperty.isWritable = !classProperty.signalName.isEmpty();
 
-        auto choppedName = QByteArray::fromRawData(typeName.constData(),
-                                                   typeName.size() - 1); // Remove trailing null
+        // Ignore trailing null
+        auto choppedName = QByteArrayView(classProperty.typeName.constData(), classProperty.typeName.size()-1);
         // The typeName for class enums is qualified with the class name.
         // Need to remove the class name  before checking if it's a class enum.
         if (auto idx = choppedName.indexOf("::"); idx >= 0) {
-            choppedName = choppedName.sliced(idx + 2);
+            choppedName.slice(idx + 2);
             if (classEnums.contains(choppedName))
-                typeName = classEnums[choppedName] + '\0'; // Update to the enum's registered name
+                classProperty.typeName = classEnums[choppedName]; // Update to the enum's registered name
         }
-
-        if (signalName.isEmpty())
-            builder.addProperty(name, typeName);
-        else
-            builder.addProperty(name, typeName, builder.indexOfSignal(signalName));
+        classData.properties.append(std::move(classProperty));
     }
 
-    auto meta = builder.toMetaObject();
-    for (auto typeInfo : enumsToBeAssignedMetaObject.keys()) {
-        auto typeInfoWithMetaObject = static_cast<TypeInfo *>(typeInfo);
-        typeInfoWithMetaObject->metaObject = meta;
-        enumTypes[meta].append(enumsToBeAssignedMetaObject.take(typeInfo));
-    }
+    auto [meta, newEnums] = registerDefinition(classData);
+    enumTypes[meta] = newEnums;
     dynamicTypes.insert(typeString, meta);
     return meta;
 }
