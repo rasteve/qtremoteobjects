@@ -158,7 +158,11 @@ int main(int argc, char **argv)
     QFile input;
     if (inputFile.isEmpty()) {
         inputFile = QStringLiteral("<stdin>");
-        input.open(stdin, QIODevice::ReadOnly);
+        if (!input.open(stdin, QIODevice::ReadOnly)) {
+            fprintf(stderr, PROGRAM_NAME ": Failed to open stdin for reading: %s\n",
+                    qPrintable(input.errorString()));
+            return 1;
+        }
     } else {
         input.setFileName(inputFile);
         if (!input.open(QIODevice::ReadOnly)) {
@@ -169,7 +173,11 @@ int main(int argc, char **argv)
 
     QFile output;
     if (outputFile.isEmpty()) {
-        output.open(stdout, QIODevice::WriteOnly);
+        if (!output.open(stdout, QIODevice::WriteOnly)) {
+            fprintf(stderr, PROGRAM_NAME ": could not open output file '%s': %s.\n",
+                    qPrintable(outputFile), qPrintable(output.errorString()));
+            return 1;
+        }
     } else {
         output.setFileName(outputFile);
         if (!output.open(QIODevice::WriteOnly)) {
